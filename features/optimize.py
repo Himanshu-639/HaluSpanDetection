@@ -57,10 +57,10 @@ def main():
                         help="Batch size")
     parser.add_argument('--features_to_use', type=str, default="key_avg,query_entropy,key_entropy,lookback_ratio",
                         help="Features to use (comma-separated). Extracted from all features.")
-    parser.add_argument('--layers_to_use', type=str, default="0-31",
-                        help="Layer numbers to use. Example: '0-31' or '0,1,2', etc.")
-    parser.add_argument('--heads_to_use', type=str, default="0-31",
-                        help="Head numbers to use. Example: '0-31' or '0,1,2', etc.")
+    parser.add_argument('--layers_to_use', type=str, default="0-27",
+                        help="Layer numbers to use. Example: '0-27' (LLaMA 3.2 3B / Qwen) or '0-31' (LLaMA 3 8B), etc.")
+    parser.add_argument('--heads_to_use', type=str, default="0-23",
+                        help="Head numbers to use. Example: '0-23' (LLaMA 3.2 3B), '0-27' (Qwen), '0-31' (LLaMA 3 8B), etc.")
     parser.add_argument('--clf_mode', type=str, default='transformer',
                         help="Classification mode: 'transformer' or 'lookback_ratio_lr'")
     parser.add_argument('--top_models_json_path', type=str, default=None,
@@ -70,8 +70,8 @@ def main():
                         help="Decoder type in span mode: 'crf' or 'linear'")
     
     # Choose the type of model
-    parser.add_argument('--model_type', type=str, default='llama', choices=['llama', 'qwen'],
-                        help="Type of model to retrieve features: 'llama' or 'qwen'")
+    parser.add_argument('--model_type', type=str, default='llama', choices=['llama', 'qwen', 'llama3.2_3b', 'llama_3b'],
+                        help="Type of model to retrieve features: 'llama', 'llama3.2_3b', or 'qwen'")
 
     args = parser.parse_args()
 
@@ -315,19 +315,14 @@ def main():
                         valid_feature = feature[:, :, valid_indices]
                         if current_length > max_length:
                             valid_feature = valid_feature[:, :, :max_length]
+                        num_l, num_h = feature.shape[0], feature.shape[1]
                         if pad_size > 0:
-                            if model_type == 'llama':
-                                feature_padding = torch.zeros(32, 32, pad_size)
-                            elif model_type == 'qwen':
-                                feature_padding = torch.zeros(28, 28, pad_size)
+                            feature_padding = torch.zeros(num_l, num_h, pad_size)
                             valid_feature = torch.cat((valid_feature, feature_padding), dim=-1)
                         elif pad_size < 0:
                             valid_feature = valid_feature[:, :, :max_length]
                         
-                        if model_type == 'llama':
-                            reshaped = valid_feature.permute(2, 0, 1).reshape(max_length, 32 * 32)
-                        elif model_type == 'qwen':
-                            reshaped = valid_feature.permute(2, 0, 1).reshape(max_length, 28 * 28)
+                        reshaped = valid_feature.permute(2, 0, 1).reshape(max_length, num_l * num_h)
                         feature_blocks[feature_name].append(reshaped.unsqueeze(0))
 
                 if len(labels_list) == 0:
@@ -355,7 +350,7 @@ def main():
                 dataset = TensorDataset(features_tensor, labels_tensor, masks_tensor, labels_mask_tensor)
                 return dataset, input_dim
             
-            # Both for llama and qwen (32->28, 1024->784)
+            # Dynamic layer and head dimension handling
             def preprocess_pooling(df, pooling_type, model_type):
                 labels = df['label'].tolist()
                 features_dict = {
@@ -372,11 +367,9 @@ def main():
                     for f_ in features:
                         seq_length = f_.shape[-1]
                         padding_length = max_length - seq_length
+                        num_l, num_h = f_.shape[0], f_.shape[1]
                         if padding_length > 0:
-                            if model_type == 'llama':
-                                padding = torch.zeros((32, 32, padding_length))
-                            elif model_type == 'qwen':
-                                padding = torch.zeros((28, 28, padding_length))
+                            padding = torch.zeros((num_l, num_h, padding_length))
                             feature_padded = torch.cat((f_, padding), dim=-1)
                         else:
                             feature_padded = f_[:, :, :max_length]
@@ -385,10 +378,8 @@ def main():
                     features_tensor = torch.cat(padded_features, dim=0)
                     num_samples_ = features_tensor.shape[0]
                     seq_length_ = features_tensor.shape[-1]
-                    if model_type == 'llama':
-                        input_dim_single = 32 * 32
-                    elif model_type == 'qwen':
-                        input_dim_single = 28 * 28
+                    num_l, num_h = features[0].shape[0], features[0].shape[1]
+                    input_dim_single = num_l * num_h
                     features_tensor = features_tensor.permute(0, 3, 1, 2).reshape(
                         num_samples_, seq_length_, input_dim_single
                     )
@@ -414,9 +405,9 @@ def main():
                 return dataset, input_dim, max_length
 
             if mode == 'pooling':
-                train_dataset, input_dim, max_length_train = preprocess_pooling(train_df, pooling_type)
-                val_dataset, input_dim_val, max_length_val = preprocess_pooling(val_df, pooling_type)
-                test_dataset, input_dim_test, max_length_test = preprocess_pooling(test_df, pooling_type)
+                train_dataset, input_dim, max_length_train = preprocess_pooling(train_df, pooling_type, model_type)
+                val_dataset, input_dim_val, max_length_val = preprocess_pooling(val_df, pooling_type, model_type)
+                test_dataset, input_dim_test, max_length_test = preprocess_pooling(test_df, pooling_type, model_type)
                 assert input_dim == input_dim_val == input_dim_test
                 max_length = max_length_train
                 train_all_texts, val_all_texts, test_all_texts = [], [], []
@@ -507,48 +498,52 @@ def main():
         def subset_features_dataset(dataset, mode,model_type):
             all_tensors = dataset.tensors
             features = all_tensors[0]
+            num_total_features = len(chosen_feature_names)
+            block_dim = features.shape[-1] // num_total_features
+
+            if block_dim == 672 or model_type in ['llama3.2_3b', 'llama_3b']:
+                num_l, num_h = 28, 24
+            elif block_dim == 784 or model_type == 'qwen':
+                num_l, num_h = 28, 28
+            elif block_dim == 1024 or model_type == 'llama':
+                num_l, num_h = 32, 32
+            else:
+                num_l = 28
+                num_h = 24 if 'llama' in model_type else 28
+
+            valid_layers = [l for l in layers_to_use if l < num_l]
+            valid_heads = [h for h in heads_to_use if h < num_h]
+
             selected_features_list = []
             for i, feat_name in enumerate(chosen_feature_names):
                 base_name = feat_name.replace(f"{feature_type}_", "")
                 if base_name in requested_features:
-                    if model_type == 'llama':
-                        start = i * 1024
-                        end = (i + 1) * 1024
-                        feature_chunk = features[:, :, start:end]
-                        feature_chunk = feature_chunk.view(feature_chunk.size(0), feature_chunk.size(1), 32, 32)
-                        feature_chunk = feature_chunk[:, :, layers_to_use, :]
-                        feature_chunk = feature_chunk[:, :, :, heads_to_use]
-                        feature_chunk = feature_chunk.view(feature_chunk.size(0), feature_chunk.size(1), -1)
-                        selected_features_list.append(feature_chunk)
-                
-                elif model_type == 'qwen':
-                    start = i * 784
-                    end = (i + 1) * 784
+                    start = i * block_dim
+                    end = (i + 1) * block_dim
                     feature_chunk = features[:, :, start:end]
-                    feature_chunk = feature_chunk.view(feature_chunk.size(0), feature_chunk.size(1), 28, 28)
-                    feature_chunk = feature_chunk[:, :, layers_to_use, :]
-                    feature_chunk = feature_chunk[:, :, :, heads_to_use]
+                    feature_chunk = feature_chunk.view(feature_chunk.size(0), feature_chunk.size(1), num_l, num_h)
+                    feature_chunk = feature_chunk[:, :, valid_layers, :]
+                    feature_chunk = feature_chunk[:, :, :, valid_heads]
                     feature_chunk = feature_chunk.view(feature_chunk.size(0), feature_chunk.size(1), -1)
                     selected_features_list.append(feature_chunk)
-                    
 
             new_features = torch.cat(selected_features_list, dim=-1) if selected_features_list else features
 
             if mode == 'pooling':
                 labels = all_tensors[1]
                 masks = all_tensors[2]
-                return TensorDataset(new_features, labels, masks)
+                return TensorDataset(new_features, labels, masks), len(valid_layers), len(valid_heads)
             else:
                 labels = all_tensors[1]
                 masks = all_tensors[2]
                 labels_mask = all_tensors[3]
-                return TensorDataset(new_features, labels, masks, labels_mask)
+                return TensorDataset(new_features, labels, masks, labels_mask), len(valid_layers), len(valid_heads)
 
-        train_dataset = subset_features_dataset(train_dataset, mode, model_type)
-        val_dataset = subset_features_dataset(val_dataset, mode, model_type)
-        test_dataset = subset_features_dataset(test_dataset, mode, model_type)
+        train_dataset, num_sel_layers, num_sel_heads = subset_features_dataset(train_dataset, mode, model_type)
+        val_dataset, _, _ = subset_features_dataset(val_dataset, mode, model_type)
+        test_dataset, _, _ = subset_features_dataset(test_dataset, mode, model_type)
 
-        new_input_dim = len(requested_features) * (len(layers_to_use) * len(heads_to_use))
+        new_input_dim = len(requested_features) * (num_sel_layers * num_sel_heads)
 
         # ★ Common to the first code/second code: "lookback_ratio_lr" (logistic regression)
         #   In span mode, if the features are only lookback_ratio, train with a window

@@ -99,14 +99,14 @@ def main():
         parser.add_argument(
             "--layers_to_use",
             type=str,
-            default="0-31",
-            help="The layer number to use. Example: '0-31' or '0,1,2'",
+            default="0-27",
+            help="The layer number to use. Example: '0-27' (LLaMA 3.2 3B / Qwen) or '0-31' (LLaMA 3 8B)",
         )
         parser.add_argument(
             "--heads_to_use",
             type=str,
-            default="0-31",
-            help="The head number to use. Example: '0-31' or '0,1,2'",
+            default="0-23",
+            help="The head number to use. Example: '0-23' (LLaMA 3.2 3B), '0-27' (Qwen), '0-31' (LLaMA 3 8B)",
         )
         parser.add_argument(
             "--clf_mode",
@@ -152,13 +152,13 @@ def main():
             default=50,
             help="Number of epochs for training the Transformer model (default 50)",
         )
-        # ★ Added model_type (switch between llama / qwen)
+        # ★ Added model_type (switch between llama / qwen / llama3.2_3b)
         parser.add_argument(
             "--model_type",
             type=str,
             default="llama",
-            choices=["llama", "qwen"],
-            help="Type of model from which the features are obtained: 'llama' or 'qwen' (supports features of different dimensions)",
+            choices=["llama", "qwen", "llama3.2_3b", "llama_3b"],
+            help="Type of model from which the features are obtained: 'llama', 'llama3.2_3b', or 'qwen'",
         )
 
         args = parser.parse_args()
@@ -321,79 +321,65 @@ def main():
         ]
         chosen_feature_names = [f"{feature_type}_{feat}" for feat in all_possible_features]
 
-        # ★ Convert to 32x32 or 28x28 depending on model_type
+        # ★ Dynamic layer and head handling supporting LLaMA 3.2 3B (28x24), Qwen (28x28), and LLaMA 3 8B (32x32)
         def subset_features_dataset(dataset, mode, model_type):
             all_tensors = dataset.tensors
             features = all_tensors[0]
+            num_total_features = len(chosen_feature_names)
+            block_dim = features.shape[-1] // num_total_features
+
+            if block_dim == 672 or model_type in ["llama3.2_3b", "llama_3b"]:
+                num_l, num_h = 28, 24
+            elif block_dim == 784 or model_type == "qwen":
+                num_l, num_h = 28, 28
+            elif block_dim == 1024 or model_type == "llama":
+                num_l, num_h = 32, 32
+            else:
+                num_l = 28
+                num_h = 24 if "llama" in model_type else 28
+
+            valid_layers = [l for l in layers_to_use if l < num_l]
+            valid_heads = [h for h in heads_to_use if h < num_h]
 
             selected_features_list = []
-            # For each feature, extract the specified ones and concatenate
-            # llama: 32*32=1024, qwen: 28*28=784
             for i, feat_name in enumerate(chosen_feature_names):
                 base_name = feat_name.replace(f"{feature_type}_", "")
                 if base_name in requested_features:
-                    if model_type == "llama":
-                        # Handle 1024
-                        start = i * 1024
-                        end = (i + 1) * 1024
-                        feature_chunk = features[:, :, start:end]
-                        # shape: (N, seq_len, 32*32)
-                        feature_chunk = feature_chunk.view(
-                            feature_chunk.size(0), feature_chunk.size(1), 32, 32
-                        )
-                        # layer restriction
-                        feature_chunk = feature_chunk[:, :, layers_to_use, :]
-                        # head restriction
-                        feature_chunk = feature_chunk[:, :, :, heads_to_use]
-                        # reshape to (N, seq_len, ?)
-                        feature_chunk = feature_chunk.view(
-                            feature_chunk.size(0), feature_chunk.size(1), -1
-                        )
-                        selected_features_list.append(feature_chunk)
+                    start = i * block_dim
+                    end = (i + 1) * block_dim
+                    feature_chunk = features[:, :, start:end]
+                    feature_chunk = feature_chunk.view(
+                        feature_chunk.size(0), feature_chunk.size(1), num_l, num_h
+                    )
+                    feature_chunk = feature_chunk[:, :, valid_layers, :]
+                    feature_chunk = feature_chunk[:, :, :, valid_heads]
+                    feature_chunk = feature_chunk.view(
+                        feature_chunk.size(0), feature_chunk.size(1), -1
+                    )
+                    selected_features_list.append(feature_chunk)
 
-                    elif model_type == "qwen":
-                        # Handle 784 (28*28)
-                        start = i * 784
-                        end = (i + 1) * 784
-                        feature_chunk = features[:, :, start:end]
-                        # shape: (N, seq_len, 28*28)
-                        feature_chunk = feature_chunk.view(
-                            feature_chunk.size(0), feature_chunk.size(1), 28, 28
-                        )
-                        # layer restriction
-                        feature_chunk = feature_chunk[:, :, layers_to_use, :]
-                        # head restriction
-                        feature_chunk = feature_chunk[:, :, :, heads_to_use]
-                        # reshape
-                        feature_chunk = feature_chunk.view(
-                            feature_chunk.size(0), feature_chunk.size(1), -1
-                        )
-                        selected_features_list.append(feature_chunk)
-
-            # Concatenate
             if selected_features_list:
                 new_features = torch.cat(selected_features_list, dim=-1)
             else:
-                # If nothing was specified, keep everything concatenated
                 new_features = features
 
             if mode == "pooling":
                 labels = all_tensors[1]
                 masks = all_tensors[2]
-                return TensorDataset(new_features, labels, masks)
+                return TensorDataset(new_features, labels, masks), len(valid_layers), len(valid_heads)
             else:
                 labels = all_tensors[1]
                 masks = all_tensors[2]
                 labels_mask = all_tensors[3]
-                return TensorDataset(new_features, labels, masks, labels_mask)
+                return TensorDataset(new_features, labels, masks, labels_mask), len(valid_layers), len(valid_heads)
 
         # Apply the conversion
-        train_dataset = subset_features_dataset(train_dataset, mode, model_type)
-        val_dataset = subset_features_dataset(val_dataset, mode, model_type)
-        test_dataset = subset_features_dataset(test_dataset, mode, model_type)
+        train_dataset, num_sel_layers, num_sel_heads = subset_features_dataset(train_dataset, mode, model_type)
+        val_dataset, _, _ = subset_features_dataset(val_dataset, mode, model_type)
+        test_dataset, _, _ = subset_features_dataset(test_dataset, mode, model_type)
 
-        # Number of features to use × (layers_to_use × heads_to_use)
-        new_input_dim = len(requested_features) * (len(layers_to_use) * len(heads_to_use))
+        # Number of features to use × (valid layers × valid heads)
+        new_input_dim = len(requested_features) * (num_sel_layers * num_sel_heads)
 
         def create_dataloader(dataset, batch_size, shuffle=False):
             return DataLoader(

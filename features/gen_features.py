@@ -743,9 +743,10 @@ def get_features_with_generate(prompt, model, tokenizer, device, device_v, devic
     )
     token_norms_all_layers = get_f_lx_all_layers(individual_head_outputs_all_layers)
     
-    # Compute alpha_f_all_layers (multi_gpu mode)
+    # Compute alpha_f_all_layers (adapt dynamically to single or multi GPU)
+    calc_mode = "multi_gpu" if (device_o is not None and str(device_v) != str(device_o)) else "single"
     alpha_f_all_layers = get_alpha_fx_all_layers_optimized(
-        token_norms_all_layers, attentions, device_v, device_o, mode="multi_gpu"
+        token_norms_all_layers, attentions, device_v, device_o, mode=calc_mode
     )
     
     # Obtain features
@@ -812,7 +813,8 @@ def get_features_no_generate(prompt, model, tokenizer, device, device_v, device_
     token_norms_all_layers = get_f_lx_all_layers(individual_head_outputs_all_layers)
     
     
-    alpha_f_all_layers = get_alpha_fx_all_layers_optimized(token_norms_all_layers, attentions, device_v, device_o, mode="multi_gpu")
+    calc_mode = "multi_gpu" if (device_o is not None and str(device_v) != str(device_o)) else "single"
+    alpha_f_all_layers = get_alpha_fx_all_layers_optimized(token_norms_all_layers, attentions, device_v, device_o, mode=calc_mode)
     
     
     # Get token positions for the prompt, input, and output parts

@@ -195,11 +195,15 @@ Trains and evaluates a Transformer encoder using attention-based features.
 - **layers**
   - Specify attention layer indices as a comma-separated list.  
   - For all layers:
-    - LLaMA: `0–31`  
+    - LLaMA 3.2 3B: `0–27`
+    - LLaMA 3 8B: `0–31`  
     - Qwen: `0–27`
 
 - **heads**
-  - Specify attention head indices, in the same format as `layers`.
+  - Specify attention head indices, in the same format as `layers`:
+    - LLaMA 3.2 3B: `0–23`
+    - LLaMA 3 8B: `0–31`
+    - Qwen: `0–27`
 
 - **clf_mode**
   - Typically set to `transformer`.  
